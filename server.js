@@ -114,8 +114,14 @@ async function runGeminiVideoAnalysis(jobId) {
   } finally {
     try {
       await fs.unlink(job.filepath);
-    } catch {
-      // no-op
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") {
+        console.error("Failed to delete analyzed video file", {
+          jobId,
+          filepath: job.filepath,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
     }
   }
 }
