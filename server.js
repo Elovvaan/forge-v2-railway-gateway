@@ -9,13 +9,13 @@ import crypto from "crypto";
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: process.env.EXPRESS_JSON_LIMIT || "500mb" }));
 
 const PORT = process.env.PORT || 3000;
 const GATEWAY_TOKEN = process.env.FORGE_GATEWAY_TOKEN || "";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-const DEFAULT_MAX_VIDEO_UPLOAD_BYTES = 25 * 1024 * 1024;
+const DEFAULT_MAX_VIDEO_UPLOAD_BYTES = 500 * 1024 * 1024;
 const parsedMaxVideoUploadBytes = Number.parseInt(process.env.MAX_VIDEO_UPLOAD_BYTES || "", 10);
 const MAX_VIDEO_UPLOAD_BYTES = parsedMaxVideoUploadBytes > 0
   ? parsedMaxVideoUploadBytes
