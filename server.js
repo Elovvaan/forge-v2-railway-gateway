@@ -338,11 +338,13 @@ app.post("/video/start", requireGatewayToken, async (req, res) => {
     jobWriteChains.set(jobId, Promise.resolve());
     await persistJob(newJob);
 
+    const advertisedChunkSizeBytes = Math.min(DEFAULT_CHUNK_BYTES, MAX_CHUNK_BYTES);
+
     res.json({
       ok: true,
       job_id: jobId,
       status: "uploading",
-      chunk_size_bytes: DEFAULT_CHUNK_BYTES,
+      chunk_size_bytes: advertisedChunkSizeBytes,
       max_chunk_bytes: MAX_CHUNK_BYTES,
       chunk_upload_url: `/video/chunk/${jobId}`,
       complete_url: `/video/complete/${jobId}`,
