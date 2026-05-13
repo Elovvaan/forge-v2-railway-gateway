@@ -64,19 +64,19 @@ async function recoverJobs() {
       try {
         const raw = await fs.readFile(path.join(jobStateDir, file), "utf8");
         const job = JSON.parse(raw);
-        
+
         // Restore Set from array
         if (Array.isArray(job.chunk_offsets)) {
           job.chunk_offsets = new Set(job.chunk_offsets);
         } else {
           job.chunk_offsets = new Set();
         }
-        
+
         // Ensure new fields exist
         if (typeof job.pending_appends !== "number") {
           job.pending_appends = 0;
         }
-        
+
         if (["uploading", "queued", "processing"].includes(job.status)) {
           job.status = "analysis_failed";
           job.error = "Gateway restarted while job was in progress.";
@@ -237,7 +237,7 @@ app.post("/providers/test", requireGatewayToken, (_req, res) => {
 app.post("/video/start", requireGatewayToken, async (req, res) => {
   try {
     const { filename = "upload.mp4", mimetype = "video/mp4" } = req.body || {};
-    
+
     if (typeof filename !== "string" || filename.trim() === "") {
       return res.status(400).json({ ok: false, error: "Invalid filename", message: "filename must be a non-empty string." });
     }
@@ -276,8 +276,8 @@ app.post("/video/start", requireGatewayToken, async (req, res) => {
 });
 
 app.post("/video/chunk/:job_id", requireGatewayToken, express.raw({ type: "application/octet-stream", limit: `${MAX_CHUNK_BYTES}b` }), async (req, res) => {
+  const jobId = String(req.params.job_id);
   try {
-    const jobId = req.params.job_id;
     const job = jobs.get(jobId);
     if (!job) return res.status(404).json({ ok: false, error: "Job not found", job_id: jobId });
     if (job.status !== "uploading") return res.status(409).json({ ok: false, error: "Job is not accepting chunks", status: job.status });
@@ -289,11 +289,11 @@ app.post("/video/chunk/:job_id", requireGatewayToken, express.raw({ type: "appli
 
     const offsetHeader = req.headers["x-chunk-offset"];
     const offset = offsetHeader ? Number.parseInt(String(offsetHeader), 10) : null;
-    
+
     if (offset === null || !Number.isInteger(offset) || offset < 0) {
       return res.status(400).json({ ok: false, error: "Missing or invalid x-chunk-offset header", message: "Send a non-negative integer offset." });
     }
-    
+
     if (job.chunk_offsets.has(offset)) {
       return res.json({ ok: true, job_id: jobId, status: job.status, chunks_received: job.chunks_received, bytes_received: job.bytes_received, message: "Chunk already received (idempotent)." });
     }
@@ -323,7 +323,6 @@ app.post("/video/chunk/:job_id", requireGatewayToken, express.raw({ type: "appli
 
     return res.json({ ok: true, job_id: jobId, status: job.status, chunks_received: job.chunks_received, bytes_received: job.bytes_received });
   } catch (error) {
-    const jobId = req.params.job_id;
     const job = jobs.get(jobId);
     if (job && job.pending_appends > 0) {
       job.pending_appends -= 1;
