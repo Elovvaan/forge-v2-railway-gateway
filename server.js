@@ -29,6 +29,8 @@ const JOB_TTL_MS = (() => {
 const uploadDir = path.join(os.tmpdir(), "forge-gateway-chunked");
 const jobStateDir = path.join(os.tmpdir(), "forge-gateway-jobs");
 const jobs = new Map();
+// Per-job write chains: serializes concurrent appendFile calls to prevent interleaved writes
+const jobWriteChains = new Map();
 
 function nowIso() {
   return new Date().toISOString();
@@ -101,7 +103,14 @@ async function pruneExpiredJobs() {
     if (age > JOB_TTL_MS) {
       jobs.delete(jobId);
       await removeJobState(jobId);
-      try { await fs.unlink(job.filepath); } catch { /* already gone */ }
+      try {
+        await fs.unlink(job.filepath);
+      } catch (err) {
+        if (err.code !== "ENOENT") {
+          console.error("Failed to unlink expired job temp file", { jobId, filepath: job.filepath, error: err.message });
+        }
+      }
+      jobWriteChains.delete(jobId);
     }
   }
 }
@@ -199,6 +208,7 @@ async function runGeminiVideoAnalysis(jobId) {
     jobs.set(jobId, job);
     await persistJob(job);
   } finally {
+    jobWriteChains.delete(jobId);
     try {
       await fs.unlink(job.filepath);
     } catch (error) {
@@ -267,6 +277,7 @@ app.post("/video/start", requireGatewayToken, async (req, res) => {
       error: null
     };
     jobs.set(jobId, newJob);
+    jobWriteChains.set(jobId, Promise.resolve());
     await persistJob(newJob);
 
     res.json({ ok: true, job_id: jobId, status: "uploading", chunk_upload_url: `/video/chunk/${jobId}`, complete_url: `/video/complete/${jobId}`, result_url: `/video/result/${jobId}` });
@@ -312,7 +323,11 @@ app.post("/video/chunk/:job_id", requireGatewayToken, express.raw({ type: "appli
     job.pending_appends += 1;
     jobs.set(jobId, job);
 
-    await fs.appendFile(job.filepath, chunk);
+    // Serialize this write through the per-job chain so concurrent requests don't interleave bytes
+    const prevChain = jobWriteChains.get(jobId) ?? Promise.resolve();
+    const thisWrite = prevChain.then(() => fs.appendFile(job.filepath, chunk));
+    jobWriteChains.set(jobId, thisWrite.catch(() => {}));
+    await thisWrite;
     
     job.chunk_offsets.add(offset);
     job.chunks_received += 1;
