@@ -17,7 +17,102 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
 const uploadDir = path.join(os.tmpdir(), "forge-gateway-uploads");
-const jobs = new Map();
+const ACTIVE_JOB_TTL_MS = 60 * 60 * 1000;
+const TERMINAL_JOB_TTL_MS = 10 * 60 * 1000;
+const JOB_CLEANUP_INTERVAL_MS = 60 * 1000;
+
+function isTerminalJobState(job) {
+  if (!job || typeof job !== "object") return false;
+
+  const status = typeof job.status === "string" ? job.status.toLowerCase() : "";
+  return status === "completed" || status === "failed" || status === "error" || status === "cancelled";
+}
+
+function createPrunableJobsMap() {
+  const map = new Map();
+  const expirations = new Map();
+
+  function ttlForValue(value) {
+    return isTerminalJobState(value) ? TERMINAL_JOB_TTL_MS : ACTIVE_JOB_TTL_MS;
+  }
+
+  function touch(key, value) {
+    expirations.set(key, Date.now() + ttlForValue(value));
+  }
+
+  function pruneExpired(now = Date.now()) {
+    for (const [key, expiresAt] of expirations) {
+      if (expiresAt <= now) {
+        expirations.delete(key);
+        map.delete(key);
+      }
+    }
+  }
+
+  const proxy = new Proxy(map, {
+    get(target, prop, receiver) {
+      if (prop === "set") {
+        return (key, value) => {
+          pruneExpired();
+          target.set(key, value);
+          touch(key, value);
+          return receiver;
+        };
+      }
+
+      if (prop === "get") {
+        return (key) => {
+          pruneExpired();
+          const value = target.get(key);
+          if (value !== undefined) {
+            touch(key, value);
+          } else {
+            expirations.delete(key);
+          }
+          return value;
+        };
+      }
+
+      if (prop === "has") {
+        return (key) => {
+          pruneExpired();
+          return target.has(key);
+        };
+      }
+
+      if (prop === "delete") {
+        return (key) => {
+          expirations.delete(key);
+          return target.delete(key);
+        };
+      }
+
+      if (prop === "clear") {
+        return () => {
+          expirations.clear();
+          target.clear();
+        };
+      }
+
+      if (prop === "pruneExpired") {
+        return pruneExpired;
+      }
+
+      return Reflect.get(target, prop, receiver);
+    }
+  });
+
+  return proxy;
+}
+
+const jobs = createPrunableJobsMap();
+const jobsCleanupTimer = setInterval(() => {
+  jobs.pruneExpired();
+}, JOB_CLEANUP_INTERVAL_MS);
+
+if (typeof jobsCleanupTimer.unref === "function") {
+  jobsCleanupTimer.unref();
+}
 
 const storage = multer.diskStorage({
   destination: async (_req, _file, cb) => {
