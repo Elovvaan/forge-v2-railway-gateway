@@ -53,7 +53,15 @@ function createEmptyAnalysis() {
 
 function safeParseGeminiJson(text) {
   const normalized = text.trim().replace(/^```json\s*/i, "").replace(/^```/, "").replace(/```$/, "").trim();
-  return JSON.parse(normalized);
+  try {
+    return JSON.parse(normalized);
+  } catch (error) {
+    const preview = normalized.length > 500 ? `${normalized.slice(0, 500)}...` : normalized;
+    throw new Error(
+      `Gemini returned invalid JSON: ${error instanceof Error ? error.message : String(error)}. Response preview: ${preview}`,
+      error instanceof Error ? { cause: error } : undefined
+    );
+  }
 }
 
 async function ensureUploadDir() {
