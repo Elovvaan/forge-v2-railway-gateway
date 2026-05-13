@@ -22,6 +22,7 @@ const MAX_VIDEO_UPLOAD_BYTES = parsedMaxVideoUploadBytes > 0
   : DEFAULT_MAX_VIDEO_UPLOAD_BYTES;
 
 const uploadDir = path.join(os.tmpdir(), "forge-gateway-uploads");
+const jobStateDir = path.join(os.tmpdir(), "forge-gateway-job-state");
 const ACTIVE_JOB_TTL_MS = 60 * 60 * 1000;
 const TERMINAL_JOB_TTL_MS = 10 * 60 * 1000;
 const JOB_CLEANUP_INTERVAL_MS = 60 * 1000;
@@ -31,6 +32,63 @@ function isTerminalJobState(job) {
 
   const status = typeof job.status === "string" ? job.status.toLowerCase() : "";
   return status === "completed" || status === "failed" || status === "error" || status === "cancelled";
+}
+
+async function persistJobState(jobId, jobData) {
+  try {
+    await fs.mkdir(jobStateDir, { recursive: true });
+    const jobFilePath = path.join(jobStateDir, `${jobId}.json`);
+    await fs.writeFile(jobFilePath, JSON.stringify(jobData, null, 2), "utf-8");
+  } catch (error) {
+    console.error(`[job-persistence] failed to persist job_id=${jobId}`, error);
+  }
+}
+
+async function loadJobState(jobId) {
+  try {
+    const jobFilePath = path.join(jobStateDir, `${jobId}.json`);
+    const content = await fs.readFile(jobFilePath, "utf-8");
+    return JSON.parse(content);
+  } catch (error) {
+    if (!(error instanceof Error) || error.code !== "ENOENT") {
+      console.error(`[job-persistence] failed to load job_id=${jobId}`, error);
+    }
+    return null;
+  }
+}
+
+async function deleteJobState(jobId) {
+  try {
+    const jobFilePath = path.join(jobStateDir, `${jobId}.json`);
+    await fs.unlink(jobFilePath);
+  } catch (error) {
+    if (!(error instanceof Error) || error.code !== "ENOENT") {
+      console.error(`[job-persistence] failed to delete job_id=${jobId}`, error);
+    }
+  }
+}
+
+async function loadAllJobStates() {
+  try {
+    await fs.mkdir(jobStateDir, { recursive: true });
+    const files = await fs.readdir(jobStateDir);
+    const jobStates = [];
+    
+    for (const file of files) {
+      if (file.endsWith(".json")) {
+        const jobId = file.replace(".json", "");
+        const jobData = await loadJobState(jobId);
+        if (jobData) {
+          jobStates.push(jobData);
+        }
+      }
+    }
+    
+    return jobStates;
+  } catch (error) {
+    console.error("[job-persistence] failed to load all job states", error);
+    return [];
+  }
 }
 
 function createPrunableJobsMap() {
@@ -45,11 +103,12 @@ function createPrunableJobsMap() {
     expirations.set(key, Date.now() + ttlForValue(value));
   }
 
-  function pruneExpired(now = Date.now()) {
+  async function pruneExpired(now = Date.now()) {
     for (const [key, expiresAt] of expirations) {
       if (expiresAt <= now) {
         expirations.delete(key);
         map.delete(key);
+        await deleteJobState(key);
       }
     }
   }
@@ -61,6 +120,7 @@ function createPrunableJobsMap() {
           pruneExpired();
           target.set(key, value);
           touch(key, value);
+          persistJobState(key, value);
           return receiver;
         };
       }
@@ -88,6 +148,7 @@ function createPrunableJobsMap() {
       if (prop === "delete") {
         return (key) => {
           expirations.delete(key);
+          deleteJobState(key);
           return target.delete(key);
         };
       }
@@ -438,6 +499,43 @@ app.use((error, req, res, next) => {
   next(error);
 });
 
-app.listen(PORT, () => {
+async function recoverJobsOnStartup() {
+  console.log("[startup] recovering persisted job state...");
+  
+  const persistedJobs = await loadAllJobStates();
+  let recoveredCount = 0;
+  let orphanedCount = 0;
+  
+  for (const jobData of persistedJobs) {
+    const jobId = jobData.job_id;
+    
+    if (jobData.status === "queued" || jobData.status === "processing") {
+      jobData.status = "analysis_failed";
+      jobData.error = "Server restarted during processing";
+      jobData.completed_at = nowIso();
+      
+      if (jobData.filepath) {
+        try {
+          await fs.unlink(jobData.filepath);
+          console.log(`[startup] cleaned orphaned file for job_id=${jobId}`);
+        } catch (error) {
+          if (!(error instanceof Error) || error.code !== "ENOENT") {
+            console.error(`[startup] failed to clean file for job_id=${jobId}`, error);
+          }
+        }
+      }
+      
+      orphanedCount++;
+    }
+    
+    jobs.set(jobId, jobData);
+    recoveredCount++;
+  }
+  
+  console.log(`[startup] recovered ${recoveredCount} jobs (${orphanedCount} marked as failed due to restart)`);
+}
+
+app.listen(PORT, async () => {
   console.log(`SAIN Forge Railway Gateway online on port ${PORT}`);
+  await recoverJobsOnStartup();
 });
