@@ -14,12 +14,70 @@ const GATEWAY_TOKEN = process.env.FORGE_GATEWAY_TOKEN || "";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const MAX_CHUNK_BYTES = Number.parseInt(process.env.MAX_CHUNK_BYTES || "", 10) || 20 * 1024 * 1024;
+const MAX_FILE_BYTES = Number.parseInt(process.env.MAX_FILE_BYTES || "", 10) || 2 * 1024 * 1024 * 1024;
+const JOB_TTL_MS = Number.parseInt(process.env.JOB_TTL_MS || "", 10) || 2 * 60 * 60 * 1000;
 
 const uploadDir = path.join(os.tmpdir(), "forge-gateway-chunked");
+const jobStateDir = path.join(os.tmpdir(), "forge-gateway-jobs");
 const jobs = new Map();
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+async function persistJob(job) {
+  try {
+    await fs.mkdir(jobStateDir, { recursive: true });
+    await fs.writeFile(path.join(jobStateDir, `${job.job_id}.json`), JSON.stringify(job), "utf8");
+  } catch {
+    // best-effort; in-memory state is authoritative
+  }
+}
+
+async function removeJobState(jobId) {
+  try {
+    await fs.unlink(path.join(jobStateDir, `${jobId}.json`));
+  } catch {
+    // no-op if already absent
+  }
+}
+
+async function recoverJobs() {
+  try {
+    await fs.mkdir(jobStateDir, { recursive: true });
+    const files = await fs.readdir(jobStateDir);
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        const raw = await fs.readFile(path.join(jobStateDir, file), "utf8");
+        const job = JSON.parse(raw);
+        if (["uploading", "queued", "processing"].includes(job.status)) {
+          job.status = "analysis_failed";
+          job.error = "Gateway restarted while job was in progress.";
+          job.completed_at = nowIso();
+          try { await fs.unlink(job.filepath); } catch { /* orphaned file gone or missing */ }
+          await persistJob(job);
+        }
+        jobs.set(job.job_id, job);
+      } catch {
+        // corrupt state file — skip
+      }
+    }
+  } catch {
+    // state dir unreadable — start fresh
+  }
+}
+
+async function pruneExpiredJobs() {
+  const now = Date.now();
+  for (const [jobId, job] of jobs.entries()) {
+    const age = now - new Date(job.created_at).getTime();
+    if (age > JOB_TTL_MS) {
+      jobs.delete(jobId);
+      await removeJobState(jobId);
+      try { await fs.unlink(job.filepath); } catch { /* already gone */ }
+    }
+  }
 }
 
 function requireGatewayToken(req, res, next) {
@@ -78,6 +136,7 @@ async function runGeminiVideoAnalysis(jobId) {
     job.status = "processing";
     job.processing_started_at = nowIso();
     jobs.set(jobId, job);
+    await persistJob(job);
 
     const fileBuffer = await fs.readFile(job.filepath);
     const videoBase64 = fileBuffer.toString("base64");
@@ -106,11 +165,13 @@ async function runGeminiVideoAnalysis(jobId) {
     job.status = "analysis_complete";
     job.completed_at = nowIso();
     jobs.set(jobId, job);
+    await persistJob(job);
   } catch (error) {
     job.status = "analysis_failed";
     job.error = error instanceof Error ? error.message : String(error);
     job.completed_at = nowIso();
     jobs.set(jobId, job);
+    await persistJob(job);
   } finally {
     try {
       await fs.unlink(job.filepath);
@@ -155,7 +216,7 @@ app.post("/video/start", requireGatewayToken, async (req, res) => {
   const filepath = path.join(uploadDir, `${jobId}${path.extname(filename) || ".mp4"}`);
   await fs.writeFile(filepath, Buffer.alloc(0));
 
-  jobs.set(jobId, {
+  const newJob = {
     job_id: jobId,
     status: "uploading",
     created_at: nowIso(),
@@ -166,7 +227,9 @@ app.post("/video/start", requireGatewayToken, async (req, res) => {
     bytes_received: 0,
     result: null,
     error: null
-  });
+  };
+  jobs.set(jobId, newJob);
+  await persistJob(newJob);
 
   res.json({ ok: true, job_id: jobId, status: "uploading", chunk_upload_url: `/video/chunk/${jobId}`, complete_url: `/video/complete/${jobId}`, result_url: `/video/result/${jobId}` });
 });
@@ -182,10 +245,21 @@ app.post("/video/chunk/:job_id", requireGatewayToken, express.raw({ type: "appli
     return res.status(400).json({ ok: false, error: "Missing chunk body. Send raw application/octet-stream." });
   }
 
+  if (job.bytes_received + chunk.length > MAX_FILE_BYTES) {
+    return res.status(413).json({
+      ok: false,
+      error: "Upload size limit exceeded",
+      message: `File would exceed the ${MAX_FILE_BYTES}-byte maximum.`,
+      bytes_received: job.bytes_received,
+      max_file_bytes: MAX_FILE_BYTES
+    });
+  }
+
   await fs.appendFile(job.filepath, chunk);
   job.chunks_received += 1;
   job.bytes_received += chunk.length;
   jobs.set(jobId, job);
+  await persistJob(job);
 
   return res.json({ ok: true, job_id: jobId, status: job.status, chunks_received: job.chunks_received, bytes_received: job.bytes_received });
 });
@@ -199,6 +273,7 @@ app.post("/video/complete/:job_id", requireGatewayToken, async (req, res) => {
   job.status = "queued";
   job.upload_completed_at = nowIso();
   jobs.set(jobId, job);
+  await persistJob(job);
 
   setImmediate(() => {
     runGeminiVideoAnalysis(jobId);
@@ -222,6 +297,9 @@ app.get("/video/result/:job_id", requireGatewayToken, (req, res) => {
 
   return res.json({ ok: true, job_id: jobId, status: "analysis_complete", completed_at: job.completed_at, ...job.result });
 });
+
+await recoverJobs();
+setInterval(pruneExpiredJobs, 60 * 60 * 1000);
 
 app.listen(PORT, () => {
   console.log(`forge-gateway listening on port ${PORT}`);
