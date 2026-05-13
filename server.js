@@ -151,6 +151,16 @@ async function runGeminiVideoAnalysis(jobId) {
     job.error = error instanceof Error ? error.message : String(error);
     jobs.set(jobId, job);
     console.error(`[video-job] failed job_id=${jobId}`, error);
+  } finally {
+    if (job.filepath) {
+      try {
+        await fs.unlink(job.filepath);
+      } catch (cleanupError) {
+        if (!(cleanupError instanceof Error) || cleanupError.code !== "ENOENT") {
+          console.error(`[video-job] cleanup failed job_id=${jobId} filepath=${job.filepath}`, cleanupError);
+        }
+      }
+    }
   }
 }
 
