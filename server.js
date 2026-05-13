@@ -117,7 +117,7 @@ function safeParseGeminiJson(text) {
     const preview = normalized.length > 500 ? `${normalized.slice(0, 500)}...` : normalized;
     throw new Error(
       `Gemini returned invalid JSON: ${error instanceof Error ? error.message : String(error)}. Response preview: ${preview}`,
-      error instanceof Error ? { cause: error } : undefined
+      { cause: error }
     );
   }
 }
@@ -176,7 +176,7 @@ async function runGeminiVideoAnalysis(jobId) {
     try {
       await fs.unlink(job.filepath);
     } catch (error) {
-      if (!error || error.code !== "ENOENT") {
+      if (error?.code !== "ENOENT") {
         console.error("Failed to delete analyzed video file", {
           jobId,
           filepath: job.filepath,
@@ -241,11 +241,12 @@ app.post("/video/chunk/:job_id", requireGatewayToken, express.raw({ type: "appli
   if (job.status !== "uploading") return res.status(409).json({ ok: false, error: "Job is not accepting chunks", status: job.status });
 
   const chunk = req.body;
-  if (!chunk || !Buffer.isBuffer(chunk) || chunk.length === 0) {
+  if (!Buffer.isBuffer(chunk) || chunk.length === 0) {
     return res.status(400).json({ ok: false, error: "Missing chunk body. Send raw application/octet-stream." });
   }
 
-  if (job.bytes_received + chunk.length > MAX_FILE_BYTES) {
+  const chunkSize = chunk.length;
+  if (job.bytes_received + chunkSize > MAX_FILE_BYTES) {
     return res.status(413).json({
       ok: false,
       error: "Upload size limit exceeded",
@@ -257,7 +258,7 @@ app.post("/video/chunk/:job_id", requireGatewayToken, express.raw({ type: "appli
 
   await fs.appendFile(job.filepath, chunk);
   job.chunks_received += 1;
-  job.bytes_received += chunk.length;
+  job.bytes_received += chunkSize;
   jobs.set(jobId, job);
   await persistJob(job);
 
@@ -299,7 +300,8 @@ app.get("/video/result/:job_id", requireGatewayToken, (req, res) => {
 });
 
 await recoverJobs();
-setInterval(pruneExpiredJobs, 60 * 60 * 1000);
+const pruneInterval = setInterval(pruneExpiredJobs, 60 * 60 * 1000);
+pruneInterval.unref();
 
 app.listen(PORT, () => {
   console.log(`forge-gateway listening on port ${PORT}`);
