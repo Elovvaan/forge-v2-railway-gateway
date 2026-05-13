@@ -16,8 +16,9 @@ const GATEWAY_TOKEN = process.env.FORGE_GATEWAY_TOKEN || "";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const DEFAULT_MAX_VIDEO_UPLOAD_BYTES = 25 * 1024 * 1024;
-const MAX_VIDEO_UPLOAD_BYTES = Number.parseInt(process.env.MAX_VIDEO_UPLOAD_BYTES || "", 10) > 0
-  ? Number.parseInt(process.env.MAX_VIDEO_UPLOAD_BYTES, 10)
+const parsedMaxVideoUploadBytes = Number.parseInt(process.env.MAX_VIDEO_UPLOAD_BYTES || "", 10);
+const MAX_VIDEO_UPLOAD_BYTES = parsedMaxVideoUploadBytes > 0
+  ? parsedMaxVideoUploadBytes
   : DEFAULT_MAX_VIDEO_UPLOAD_BYTES;
 
 const uploadDir = path.join(os.tmpdir(), "forge-gateway-uploads");
