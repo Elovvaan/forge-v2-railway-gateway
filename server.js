@@ -47,10 +47,39 @@ function delay(ms) {
 async function appendChunkWithRetry({ jobId, filepath, chunk }) {
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let initialSize = 0;
     try {
+      try {
+        const stats = await fs.stat(filepath);
+        initialSize = stats.size;
+      } catch (statError) {
+        if (!statError || statError.code !== "ENOENT") {
+          throw statError;
+        }
+      }
+
       await fs.appendFile(filepath, chunk);
       return;
     } catch (error) {
+      try {
+        const statsAfterFailure = await fs.stat(filepath);
+        if (statsAfterFailure.size > initialSize) {
+          await fs.truncate(filepath, initialSize);
+        }
+      } catch (truncateError) {
+        if (!truncateError || truncateError.code !== "ENOENT") {
+          console.warn("Failed to restore file after chunk append failure", {
+            jobId,
+            filepath,
+            expected_size: initialSize,
+            error:
+              truncateError instanceof Error
+                ? truncateError.message
+                : String(truncateError)
+          });
+        }
+      }
+
       if (attempt === maxAttempts) {
         throw error;
       }
