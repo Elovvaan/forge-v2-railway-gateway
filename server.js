@@ -31,7 +31,7 @@ function isTerminalJobState(job) {
   if (!job || typeof job !== "object") return false;
 
   const status = typeof job.status === "string" ? job.status.toLowerCase() : "";
-  return status === "completed" || status === "failed" || status === "error" || status === "cancelled";
+  return status === "completed" || status === "failed" || status === "error" || status === "cancelled" || status === "analysis_complete" || status === "analysis_failed";
 }
 
 async function persistJobState(jobId, jobData) {
@@ -120,7 +120,9 @@ function createPrunableJobsMap() {
           pruneExpired();
           target.set(key, value);
           touch(key, value);
-          persistJobState(key, value);
+          persistJobState(key, value).catch((error) => {
+            console.error(`[job-persistence] async persist failed for job_id=${key}`, error);
+          });
           return receiver;
         };
       }
@@ -148,7 +150,9 @@ function createPrunableJobsMap() {
       if (prop === "delete") {
         return (key) => {
           expirations.delete(key);
-          deleteJobState(key);
+          deleteJobState(key).catch((error) => {
+            console.error(`[job-persistence] async delete failed for job_id=${key}`, error);
+          });
           return target.delete(key);
         };
       }
