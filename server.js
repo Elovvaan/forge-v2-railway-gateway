@@ -57,7 +57,7 @@ async function appendChunkWithRetry({ jobId, filepath, chunk }) {
       console.warn("Chunk append failed; retrying", {
         jobId,
         retry_count: attempt,
-        max_attempts: maxAttempts,
+        max_retries: maxAttempts - 1,
         error: error instanceof Error ? error.message : String(error)
       });
       await delay(2000);
@@ -336,8 +336,9 @@ app.post("/video/chunk/:job_id", requireGatewayToken, express.raw({ type: "appli
       return res.status(400).json({ ok: false, error: "Missing chunk body. Send raw application/octet-stream." });
     }
 
-    const offsetHeader = req.headers["x-chunk-offset"];
-    const offset = offsetHeader ? Number.parseInt(String(offsetHeader), 10) : null;
+    const offsetHeaderRaw = req.headers["x-chunk-offset"];
+    const offsetHeader = Array.isArray(offsetHeaderRaw) ? offsetHeaderRaw[0] : offsetHeaderRaw;
+    const offset = typeof offsetHeader === "undefined" ? null : Number.parseInt(String(offsetHeader), 10);
 
     if (offset === null || !Number.isInteger(offset) || offset < 0) {
       return res.status(400).json({ ok: false, error: "Missing or invalid x-chunk-offset header", message: "Send a non-negative integer offset." });
