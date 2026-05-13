@@ -13,9 +13,18 @@ const PORT = process.env.PORT || 3000;
 const GATEWAY_TOKEN = process.env.FORGE_GATEWAY_TOKEN || "";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-const MAX_CHUNK_BYTES = Number.parseInt(process.env.MAX_CHUNK_BYTES || "", 10) || 20 * 1024 * 1024;
-const MAX_FILE_BYTES = Number.parseInt(process.env.MAX_FILE_BYTES || "", 10) || 2 * 1024 * 1024 * 1024;
-const JOB_TTL_MS = Number.parseInt(process.env.JOB_TTL_MS || "", 10) || 2 * 60 * 60 * 1000;
+const MAX_CHUNK_BYTES = (() => {
+  const parsed = Number.parseInt(process.env.MAX_CHUNK_BYTES || "", 10);
+  return parsed > 0 ? parsed : 20 * 1024 * 1024;
+})();
+const MAX_FILE_BYTES = (() => {
+  const parsed = Number.parseInt(process.env.MAX_FILE_BYTES || "", 10);
+  return parsed > 0 ? parsed : 2 * 1024 * 1024 * 1024;
+})();
+const JOB_TTL_MS = (() => {
+  const parsed = Number.parseInt(process.env.JOB_TTL_MS || "", 10);
+  return parsed > 0 ? parsed : 2 * 60 * 60 * 1000;
+})();
 
 const uploadDir = path.join(os.tmpdir(), "forge-gateway-chunked");
 const jobStateDir = path.join(os.tmpdir(), "forge-gateway-jobs");
@@ -28,7 +37,11 @@ function nowIso() {
 async function persistJob(job) {
   try {
     await fs.mkdir(jobStateDir, { recursive: true });
-    await fs.writeFile(path.join(jobStateDir, `${job.job_id}.json`), JSON.stringify(job), "utf8");
+    const serializable = {
+      ...job,
+      chunk_offsets: job.chunk_offsets ? Array.from(job.chunk_offsets) : []
+    };
+    await fs.writeFile(path.join(jobStateDir, `${job.job_id}.json`), JSON.stringify(serializable), "utf8");
   } catch {
     // best-effort; in-memory state is authoritative
   }
@@ -51,6 +64,19 @@ async function recoverJobs() {
       try {
         const raw = await fs.readFile(path.join(jobStateDir, file), "utf8");
         const job = JSON.parse(raw);
+        
+        // Restore Set from array
+        if (Array.isArray(job.chunk_offsets)) {
+          job.chunk_offsets = new Set(job.chunk_offsets);
+        } else {
+          job.chunk_offsets = new Set();
+        }
+        
+        // Ensure new fields exist
+        if (typeof job.pending_appends !== "number") {
+          job.pending_appends = 0;
+        }
+        
         if (["uploading", "queued", "processing"].includes(job.status)) {
           job.status = "analysis_failed";
           job.error = "Gateway restarted while job was in progress.";
@@ -209,78 +235,132 @@ app.post("/providers/test", requireGatewayToken, (_req, res) => {
 });
 
 app.post("/video/start", requireGatewayToken, async (req, res) => {
-  const { filename = "upload.mp4", mimetype = "video/mp4" } = req.body || {};
-  const jobId = `forge_video_${Date.now()}_${crypto.randomUUID()}`;
-  await ensureUploadDir();
+  try {
+    const { filename = "upload.mp4", mimetype = "video/mp4" } = req.body || {};
+    
+    if (typeof filename !== "string" || filename.trim() === "") {
+      return res.status(400).json({ ok: false, error: "Invalid filename", message: "filename must be a non-empty string." });
+    }
+    if (typeof mimetype !== "string" || mimetype.trim() === "") {
+      return res.status(400).json({ ok: false, error: "Invalid mimetype", message: "mimetype must be a non-empty string." });
+    }
+    
+    const jobId = `forge_video_${Date.now()}_${crypto.randomUUID()}`;
+    await ensureUploadDir();
 
-  const filepath = path.join(uploadDir, `${jobId}${path.extname(filename) || ".mp4"}`);
-  await fs.writeFile(filepath, Buffer.alloc(0));
+    const filepath = path.join(uploadDir, `${jobId}${path.extname(filename) || ".mp4"}`);
+    await fs.writeFile(filepath, Buffer.alloc(0));
 
-  const newJob = {
-    job_id: jobId,
-    status: "uploading",
-    created_at: nowIso(),
-    filepath,
-    filename,
-    mimetype,
-    chunks_received: 0,
-    bytes_received: 0,
-    result: null,
-    error: null
-  };
-  jobs.set(jobId, newJob);
-  await persistJob(newJob);
+    const newJob = {
+      job_id: jobId,
+      status: "uploading",
+      created_at: nowIso(),
+      filepath,
+      filename,
+      mimetype,
+      chunks_received: 0,
+      bytes_received: 0,
+      expected_chunks: null,
+      chunk_offsets: new Set(),
+      pending_appends: 0,
+      result: null,
+      error: null
+    };
+    jobs.set(jobId, newJob);
+    await persistJob(newJob);
 
-  res.json({ ok: true, job_id: jobId, status: "uploading", chunk_upload_url: `/video/chunk/${jobId}`, complete_url: `/video/complete/${jobId}`, result_url: `/video/result/${jobId}` });
+    res.json({ ok: true, job_id: jobId, status: "uploading", chunk_upload_url: `/video/chunk/${jobId}`, complete_url: `/video/complete/${jobId}`, result_url: `/video/result/${jobId}` });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: "Internal server error", message: error instanceof Error ? error.message : String(error) });
+  }
 });
 
 app.post("/video/chunk/:job_id", requireGatewayToken, express.raw({ type: "application/octet-stream", limit: `${MAX_CHUNK_BYTES}b` }), async (req, res) => {
-  const jobId = req.params.job_id;
-  const job = jobs.get(jobId);
-  if (!job) return res.status(404).json({ ok: false, error: "Job not found", job_id: jobId });
-  if (job.status !== "uploading") return res.status(409).json({ ok: false, error: "Job is not accepting chunks", status: job.status });
+  try {
+    const jobId = req.params.job_id;
+    const job = jobs.get(jobId);
+    if (!job) return res.status(404).json({ ok: false, error: "Job not found", job_id: jobId });
+    if (job.status !== "uploading") return res.status(409).json({ ok: false, error: "Job is not accepting chunks", status: job.status });
 
-  const chunk = req.body;
-  if (!Buffer.isBuffer(chunk) || chunk.length === 0) {
-    return res.status(400).json({ ok: false, error: "Missing chunk body. Send raw application/octet-stream." });
+    const chunk = req.body;
+    if (!Buffer.isBuffer(chunk) || chunk.length === 0) {
+      return res.status(400).json({ ok: false, error: "Missing chunk body. Send raw application/octet-stream." });
+    }
+
+    const offsetHeader = req.headers["x-chunk-offset"];
+    const offset = offsetHeader ? Number.parseInt(String(offsetHeader), 10) : null;
+    
+    if (offset === null || !Number.isInteger(offset) || offset < 0) {
+      return res.status(400).json({ ok: false, error: "Missing or invalid x-chunk-offset header", message: "Send a non-negative integer offset." });
+    }
+    
+    if (job.chunk_offsets.has(offset)) {
+      return res.json({ ok: true, job_id: jobId, status: job.status, chunks_received: job.chunks_received, bytes_received: job.bytes_received, message: "Chunk already received (idempotent)." });
+    }
+
+    const chunkSize = chunk.length;
+    if (job.bytes_received + chunkSize > MAX_FILE_BYTES) {
+      return res.status(413).json({
+        ok: false,
+        error: "Upload size limit exceeded",
+        message: `File would exceed the ${MAX_FILE_BYTES}-byte maximum.`,
+        bytes_received: job.bytes_received,
+        max_file_bytes: MAX_FILE_BYTES
+      });
+    }
+
+    job.pending_appends += 1;
+    jobs.set(jobId, job);
+
+    await fs.appendFile(job.filepath, chunk);
+    
+    job.chunk_offsets.add(offset);
+    job.chunks_received += 1;
+    job.bytes_received += chunkSize;
+    job.pending_appends -= 1;
+    jobs.set(jobId, job);
+    await persistJob(job);
+
+    return res.json({ ok: true, job_id: jobId, status: job.status, chunks_received: job.chunks_received, bytes_received: job.bytes_received });
+  } catch (error) {
+    const jobId = req.params.job_id;
+    const job = jobs.get(jobId);
+    if (job && job.pending_appends > 0) {
+      job.pending_appends -= 1;
+      jobs.set(jobId, job);
+    }
+    res.status(500).json({ ok: false, error: "Internal server error", message: error instanceof Error ? error.message : String(error) });
   }
-
-  const chunkSize = chunk.length;
-  if (job.bytes_received + chunkSize > MAX_FILE_BYTES) {
-    return res.status(413).json({
-      ok: false,
-      error: "Upload size limit exceeded",
-      message: `File would exceed the ${MAX_FILE_BYTES}-byte maximum.`,
-      bytes_received: job.bytes_received,
-      max_file_bytes: MAX_FILE_BYTES
-    });
-  }
-
-  await fs.appendFile(job.filepath, chunk);
-  job.chunks_received += 1;
-  job.bytes_received += chunkSize;
-  jobs.set(jobId, job);
-  await persistJob(job);
-
-  return res.json({ ok: true, job_id: jobId, status: job.status, chunks_received: job.chunks_received, bytes_received: job.bytes_received });
 });
 
 app.post("/video/complete/:job_id", requireGatewayToken, async (req, res) => {
-  const jobId = req.params.job_id;
-  const job = jobs.get(jobId);
-  if (!job) return res.status(404).json({ ok: false, error: "Job not found", job_id: jobId });
-  if (job.status !== "uploading") return res.status(409).json({ ok: false, error: "Job already completed or invalid state", status: job.status });
+  try {
+    const jobId = req.params.job_id;
+    const job = jobs.get(jobId);
+    if (!job) return res.status(404).json({ ok: false, error: "Job not found", job_id: jobId });
+    if (job.status !== "uploading") return res.status(409).json({ ok: false, error: "Job already completed or invalid state", status: job.status });
 
-  job.status = "queued";
-  job.upload_completed_at = nowIso();
-  jobs.set(jobId, job);
-  await persistJob(job);
+    if (job.bytes_received === 0) {
+      return res.status(400).json({ ok: false, error: "Cannot complete empty upload", message: "No chunks have been uploaded." });
+    }
 
-  setImmediate(() => {
-    runGeminiVideoAnalysis(jobId);
-  });
+    if (job.pending_appends > 0) {
+      return res.status(409).json({ ok: false, error: "Upload still in progress", message: `${job.pending_appends} chunk(s) still being written. Retry after a short delay.` });
+    }
 
-  return res.json({ ok: true, job_id: jobId, status: "queued", result_url: `/video/result/${jobId}` });
+    job.status = "queued";
+    job.upload_completed_at = nowIso();
+    jobs.set(jobId, job);
+    await persistJob(job);
+
+    setImmediate(() => {
+      runGeminiVideoAnalysis(jobId);
+    });
+
+    return res.json({ ok: true, job_id: jobId, status: "queued", result_url: `/video/result/${jobId}` });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: "Internal server error", message: error instanceof Error ? error.message : String(error) });
+  }
 });
 
 app.get("/video/result/:job_id", requireGatewayToken, (req, res) => {
@@ -297,6 +377,26 @@ app.get("/video/result/:job_id", requireGatewayToken, (req, res) => {
   }
 
   return res.json({ ok: true, job_id: jobId, status: "analysis_complete", completed_at: job.completed_at, ...job.result });
+});
+
+app.use((err, req, res, next) => {
+  if (err.type === "entity.too.large") {
+    return res.status(413).json({
+      ok: false,
+      error: "Payload too large",
+      message: `Chunk exceeds the ${MAX_CHUNK_BYTES}-byte limit.`,
+      max_chunk_bytes: MAX_CHUNK_BYTES
+    });
+  }
+  if (err.status === 400 && err.type) {
+    return res.status(400).json({
+      ok: false,
+      error: "Bad request",
+      message: err.message || "Invalid request body."
+    });
+  }
+  console.error("Unhandled error:", err);
+  res.status(500).json({ ok: false, error: "Internal server error", message: err.message || String(err) });
 });
 
 await recoverJobs();
