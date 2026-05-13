@@ -168,7 +168,14 @@ function createEmptyAnalysis() {
 
 function safeParseGeminiJson(text) {
   const normalized = text.trim().replace(/^```json\s*/i, "").replace(/^```/, "").replace(/```$/, "").trim();
-  return JSON.parse(normalized);
+
+  try {
+    return JSON.parse(normalized);
+  } catch (error) {
+    const preview = text.length > 500 ? `${text.slice(0, 500)}…` : text;
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Gemini returned invalid JSON: ${reason}. Response preview: ${JSON.stringify(preview)}`);
+  }
 }
 
 async function runGeminiVideoAnalysis(jobId) {
