@@ -15,6 +15,10 @@ const PORT = process.env.PORT || 3000;
 const GATEWAY_TOKEN = process.env.FORGE_GATEWAY_TOKEN || "";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const DEFAULT_MAX_VIDEO_UPLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_VIDEO_UPLOAD_BYTES = Number.parseInt(process.env.MAX_VIDEO_UPLOAD_BYTES || "", 10) > 0
+  ? Number.parseInt(process.env.MAX_VIDEO_UPLOAD_BYTES, 10)
+  : DEFAULT_MAX_VIDEO_UPLOAD_BYTES;
 
 const uploadDir = path.join(os.tmpdir(), "forge-gateway-uploads");
 const ACTIVE_JOB_TTL_MS = 60 * 60 * 1000;
@@ -129,7 +133,10 @@ const storage = multer.diskStorage({
   }
 });
 
-const upload = multer({ storage });
+const upload = multer({
+  storage,
+  limits: { fileSize: MAX_VIDEO_UPLOAD_BYTES }
+});
 
 function requireGatewayToken(req, res, next) {
   if (!GATEWAY_TOKEN) return next();
@@ -408,6 +415,26 @@ app.post("/story/continue", requireGatewayToken, (req, res) => {
       ]
     }
   });
+});
+
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+    return res.status(413).json({
+      ok: false,
+      error: "Video file too large",
+      max_size_bytes: MAX_VIDEO_UPLOAD_BYTES
+    });
+  }
+
+  if (error instanceof multer.MulterError) {
+    return res.status(400).json({
+      ok: false,
+      error: "Upload failed",
+      message: error.message
+    });
+  }
+
+  next(error);
 });
 
 app.listen(PORT, () => {
